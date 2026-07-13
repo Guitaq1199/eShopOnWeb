@@ -1,0 +1,125 @@
+name: TFM DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore Everything.sln --locked-mode
+
+    - name: Build
+      run: dotnet build Everything.sln --configuration Release --no-restore
+
+    - name: Install CycloneDX .NET Tool
+      run: |
+        dotnet tool install --global CycloneDX
+        echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+    - name: Generate SBOM with CycloneDX
+      run: dotnet CycloneDX Everything.sln --output-format json --spec-version 1.6 --output ./sbom
+
+    - name: Upload SBOM artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cyclonedx-sbom
+        path: ./sbom/bom.json
+
+    - name: Install Grype
+      run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+    - name: Scan SBOM with Grype
+      id: grype_scan
+      continue-on-error: true
+      run: |
+        grype sbom:./sbom/bom.json -o json --file grype-results.json
+        grype sbom:./sbom/bom.json --fail-on high
+
+    - name: Upload Grype results
+      uses: actions/upload-artifact@v4
+      with:
+        name: grype-results
+        path: grype-results.json
+
+    - name: Upload SBOM to Dependency-Track
+      id: dt_upload
+      env:
+        DTRAK_URL: ${{ secrets.DTRAK_URL }}
+        DTRAK_API_KEY: ${{ secrets.DTRAK_API_KEY }}
+      run: |
+        RESPONSE=$(curl -sf -X POST "$DTRAK_URL/api/v1/bom" \
+          -H "X-Api-Key: $DTRAK_API_KEY" \
+          -F "autoCreate=true" \
+          -F "projectName=Everything" \
+          -F "projectVersion=1.0.0" \
+          -F "bom=@./sbom/bom.json")
+        echo "Response: $RESPONSE"
+        TOKEN=$(echo "$RESPONSE" | jq -r '.token')
+        echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for Dependency-Track processing
+      env:
+        DTRAK_URL: ${{ secrets.DTRAK_URL }}
+        DTRAK_API_KEY: ${{ secrets.DTRAK_API_KEY }}
+        TOKEN: ${{ steps.dt_upload.outputs.token }}
+      run: |
+        MAX_ATTEMPTS=20
+        ATTEMPT=0
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        STATUS=$(curl -sf -H "X-Api-Key: $DTRAK_API_KEY" \
+            "$DTRAK_URL/api/v1/bom/token/$TOKEN" | jq -r '.processing')
+        echo "Intento $ATTEMPT: processing=$STATUS"
+        if [ "$STATUS" = "false" ]; then
+            echo "Procesamiento completado."
+            break
+        fi
+        ATTEMPT=$((ATTEMPT+1))
+        sleep 20
+        done
+        if [ "$STATUS" = "true" ]; then
+        echo "Timeout esperando el procesamiento de Dependency-Track"
+        exit 1
+        fi
+
+    - name: Get project UUID
+      id: project_lookup
+      env:
+        DTRAK_URL: ${{ secrets.DTRAK_URL }}
+        DTRAK_API_KEY: ${{ secrets.DTRAK_API_KEY }}
+      run: |
+        UUID=$(curl -sf -H "X-Api-Key: $DTRAK_API_KEY" \
+        "$DTRAK_URL/api/v1/project/lookup?name=Everything&version=1.0.0" | jq -r '.uuid')
+        echo "uuid=$UUID" >> "$GITHUB_OUTPUT"
+        echo "Project UUID: $UUID"
+
+    - name: Check policy violations
+      env:
+        DTRAK_URL: ${{ secrets.DTRAK_URL }}
+        DTRAK_API_KEY: ${{ secrets.DTRAK_API_KEY }}
+        UUID: ${{ steps.project_lookup.outputs.uuid }}
+      run: |
+        VIOLATIONS=$(curl -sf -H "X-Api-Key: $DTRAK_API_KEY" \
+        "$DTRAK_URL/api/v1/violation/project/$UUID")
+        echo "$VIOLATIONS" | jq '.'
+        COUNT=$(echo "$VIOLATIONS" | jq 'length')
+        echo "Violaciones encontradas: $COUNT"
+        if [ "$COUNT" -gt 0 ]; then
+        echo "Quality gate FALLIDO: se encontraron $COUNT violaciones de política"
+        exit 1
+        else
+        echo "Quality gate OK: sin violaciones de política"
+        fi
