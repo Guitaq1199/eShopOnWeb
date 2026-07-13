@@ -3,6 +3,7 @@
 	<PropertyGroup>	
 		<RootNamespace>Microsoft.eShopWeb.ApplicationCore</RootNamespace>
 		<Nullable>enable</Nullable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
 	</PropertyGroup>
 
 	<ItemGroup>
